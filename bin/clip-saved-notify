@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Called by gpu-screen-recorder (-sc) once a replay has been written.
+# $1 = full path of the saved clip.
+set -u
+
+file="${1:-}"
+[ -n "$file" ] || exit 0
+
+name="$(basename "$file")"
+size="$(du -h "$file" 2>/dev/null | cut -f1)"
+
+notify-send -a Clips -i video-x-generic \
+    "Clip saved" "${name}${size:+  (${size})}" 2>/dev/null || true
+
+# Also show it in the Hyprland bar / any overlay that watches hyprctl events.
+command -v hyprctl >/dev/null 2>&1 && \
+    hyprctl notify -1 3000 "rgb(33cc33)" "Clip saved: $name" >/dev/null 2>&1 || true
+
+exit 0

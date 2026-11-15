@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Medal/ShadowPlay-style instant replay: keeps the last CLIP_BUFFER_SECONDS of
+# screen, game audio AND microphone in RAM, so a hotkey can save them
+# retroactively. Safe to run repeatedly -- autostart and the clip hotkeys both
+# call it.
+set -u
+
+GSR="$HOME/.local/bin/gpu-screen-recorder"
+OUT="${CLIP_DIR:-$HOME/Videos/Clips}"
+
+# Settings shared with the Clips panel (~/.local/bin/clip-ui).
+CONFIG="$HOME/.config/gpu-clips/config.env"
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+# Buffer length must be at least the longest clip you want: ONE buffer backs
+# every hotkey length (clip-save <seconds> asks for part of it over IPC).
+BUF_SECS="${CLIP_BUFFER_SECONDS:-60}"
+FPS="${CLIP_FPS:-60}"
+QUALITY="${CLIP_QUALITY:-18000}"
+# Game/system audio + microphone, mixed into a single track. "|" separates
+# several sources (gpu-screen-recorder mixes them with FFmpeg amix).
+# Override with e.g. CLIP_AUDIO=default_output (game only) or
+# CLIP_AUDIO="default_output|ee_source_group" (Easy Effects mic chain).
+AUDIO="${CLIP_AUDIO:-default_output|default_input}"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+LOG="$LOG_DIR/gpu-screen-recorder.log"
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
+PIDFILE="$RUNDIR/gsr-replay.pid"
+SOCK="$RUNDIR/gsr-replay.sock"
+
+mkdir -p "$OUT" "$LOG_DIR"
+
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# Already buffering (pidfile, or a leftover process from a previous session)?
+if alive "$(cat "$PIDFILE" 2>/dev/null)"; then
+    exit 0
+fi
+orphan="$(pgrep -x gpu-screen-reco 2>/dev/null | head -1)"
+if [ -n "$orphan" ]; then
+    echo "$orphan" >"$PIDFILE"
+    exit 0
+fi
+
+# Which monitor to clip. Override per-launch with CLIP_MONITOR=eDP-1 / HDMI-A-1.
+monitor="${CLIP_MONITOR:-}"
+if [ -z "$monitor" ]; then
+    monitor="$(hyprctl -j activeworkspace 2>/dev/null \
+        | sed -n 's/.*"monitor": *"\([^"]*\)".*/\1/p' | head -1)"
+fi
+if [ -z "$monitor" ] || ! "$GSR" --list-capture-options 2>/dev/null | grep -q "^${monitor}|"; then
+    monitor="$("$GSR" --list-capture-options 2>/dev/null \
+        | sed -n 's/^\([A-Za-z0-9-]*\)|[0-9]\+x[0-9]\+$/\1/p' | head -1)"
+fi
+monitor="${monitor:-eDP-1}"
+
+# A stale socket from a killed instance would make gsr-cli talk to nothing.
+rm -f "$SOCK"
+
+args=(
+    -w "$monitor"
+    -f "$FPS"
+    -c mp4
+    -r "$BUF_SECS"      # replay buffer length in seconds (RAM)
+    -bm cbr             # constant bitrate -> predictable RAM use
+    -q "$QUALITY"
+    -o "$OUT"
+    -ipc "$SOCK"        # lets gsr-cli save an arbitrary number of seconds
+    -sc "$HOME/.local/bin/clip-saved-notify"
+)
+
+start_with_audio() {
+    # setsid: own session, so the buffer survives whatever shell spawned it
+    # (Hyprland exec-once, a terminal, or the clip hotkey).
+    setsid nohup "$GSR" "${args[@]}" -a "$1" >>"$LOG" 2>&1 </dev/null &
+    echo "$!" >"$PIDFILE"
+}
+
+start_with_audio "$AUDIO"
+sleep 1.5
+
+# No microphone / unnamed source -> don't leave the user with no buffer at all.
+if ! alive "$(cat "$PIDFILE" 2>/dev/null)"; then
+    printf '%s gsr failed with audio "%s", retrying with game audio only\n' \
+        "$(date -Is)" "$AUDIO" >>"$LOG"
+    start_with_audio default_output
+    sleep 1.5
+    if ! alive "$(cat "$PIDFILE" 2>/dev/null)"; then
+        notify-send -a Clips -i dialog-error "Clipping unavailable" \
+            "Replay buffer could not start - see $LOG"
+    fi
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clips
+Comment=Save instant-replay clips, choose length, mic and monitor
+Exec=@HOME@/.local/bin/clip-ui
+Icon=media-record
+Terminal=false
+Categories=AudioVideo;Recorder;
+Keywords=clip;replay;record;medal;shadowplay;

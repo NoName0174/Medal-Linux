@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Clips -- control panel for the GPU Screen Recorder instant-replay setup.
+
+Shows whether the replay buffer is running, saves 15/30/60 s clips, toggles the
+microphone, picks the monitor and sets the buffer length. Settings live in
+~/.config/gpu-clips/config.env, which ~/.local/bin/clip-start also reads, so the
+panel and the hotkeys never disagree.
+"""
+import os
+import re
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+HOME = Path.home()
+BIN = HOME / ".local" / "bin"
+CONFIG = HOME / ".config" / "gpu-clips" / "config.env"
+RUNDIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+PIDFILE = RUNDIR / "gsr-replay.pid"
+GSR = BIN / "gpu-screen-recorder"
+
+LENGTHS = (15, 30, 60)
+DEFAULTS = {
+    "CLIP_SECONDS": "30",
+    "CLIP_BUFFER_SECONDS": "60",
+    "CLIP_MONITOR": "",
+    "CLIP_AUDIO": "default_output|default_input",
+    "CLIP_FPS": "60",
+    "CLIP_QUALITY": "18000",
+}
+MIC_MARKERS = (b"default_input", b"ee_source_group")
+
+
+def _unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _quote(value):
+    # The file is sourced by bash: quote anything a shell could re-interpret
+    # (the audio list uses "|", which would otherwise become a pipe).
+    if value == "" or any(char in value for char in ' |*$`"\''):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
+
+
+def read_config():
+    cfg = dict(DEFAULTS)
+    try:
+        for line in CONFIG.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            cfg[key.strip()] = _unquote(value)
+    except OSError:
+        pass
+    return cfg
+
+
+def write_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    body = "# Clips settings -- shared by ~/.local/bin/clip-start and clip-ui\n"
+    body += "# Values are quoted because bash sources this file.\n"
+    body += "".join(f"{key}={_quote(value)}\n" for key, value in cfg.items())
+    CONFIG.write_text(body)
+
+
+def clips_dir():
+    return Path(os.environ.get("CLIP_DIR") or HOME / "Videos" / "Clips")
+
+
+def buffer_pid():
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def buffer_cmdline():
+    pid = buffer_pid()
+    if not pid:
+        return []
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def buffer_monitor():
+    cmdline = buffer_cmdline()
+    try:
+        return cmdline[cmdline.index("-w") + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def mic_on():
+    raw = b"\0".join(part.encode() for part in buffer_cmdline())
+    return any(marker in raw for marker in MIC_MARKERS)
+
+
+def list_monitors():
+    try:
+        out = subprocess.run(
+            [str(GSR), "--list-capture-options"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [m.group(1) for m in re.finditer(r"^([A-Za-z0-9-]+)\|\d+x\d+$", out, re.MULTILINE)]
+
+
+def recent_clips(limit=6):
+    folder = clips_dir()
+    try:
+        files = [f for f in folder.iterdir() if f.suffix == ".mp4"]
+    except OSError:
+        return []
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files[:limit]
+
+
+class ClipsWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Clips")
+        self.set_default_size(430, 520)
+        self.cfg = read_config()
+        self.monitors = list_monitors()
+        self.message = ""
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for edge in ("top", "bottom", "start", "end"):
+            getattr(root, f"set_margin_{edge}")(18)
+        self.set_child(root)
+
+        # --- status -------------------------------------------------------
+        self.status = Gtk.Label(xalign=0)
+        self.status.add_css_class("title-4")
+        root.append(self.status)
+
+        self.status_detail = Gtk.Label(xalign=0)
+        self.status_detail.add_css_class("dim-label")
+        root.append(self.status_detail)
+
+        # --- save buttons -------------------------------------------------
+        save_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        save_box.set_homogeneous(True)
+        for seconds in LENGTHS:
+            button = Gtk.Button(label=f"Save {seconds}s")
+            button.add_css_class("suggested-action")
+            button.connect("clicked", lambda _b, s=seconds: self.save_clip(s))
+            save_box.append(button)
+        root.append(save_box)
+
+        root.append(Gtk.Separator())
+
+        # --- settings -----------------------------------------------------
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        root.append(grid)
+
+        grid.attach(self._label("Monitor"), 0, 0, 1, 1)
+        self.monitor_combo = Gtk.ComboBoxText()
+        for name in self.monitors or ["eDP-1"]:
+            self.monitor_combo.append_text(name)
+        active = self.cfg.get("CLIP_MONITOR") or buffer_monitor() or (self.monitors or ["eDP-1"])[0]
+        if not self.cfg.get("CLIP_MONITOR") and self.monitors:
+            self.monitor_combo.append_text("follow active monitor")
+        self.monitor_combo.set_active_id(None)
+        self._select_monitor(active)
+        self.monitor_combo.connect("changed", self.on_monitor_changed)
+        grid.attach(self.monitor_combo, 1, 0, 1, 1)
+
+        grid.attach(self._label("Buffer length"), 0, 1, 1, 1)
+        self.buffer_spin = Gtk.SpinButton.new_with_range(10, 180, 5)
+        self.buffer_spin.set_value(float(self.cfg["CLIP_BUFFER_SECONDS"]))
+        self.buffer_spin.set_tooltip_text("Seconds kept in RAM. Must be at least the longest clip.")
+        self.buffer_spin.connect("value-changed", self.on_buffer_changed)
+        grid.attach(self.buffer_spin, 1, 1, 1, 1)
+
+        grid.attach(self._label("Microphone"), 0, 2, 1, 1)
+        self.mic_switch = Gtk.Switch()
+        self.mic_switch.set_active(mic_on() if buffer_pid() else "default_input" in self.cfg["CLIP_AUDIO"])
+        self.mic_switch.set_halign(Gtk.Align.START)
+        self.mic_switch.connect("notify::active", self.on_mic_toggled)
+        grid.attach(self.mic_switch, 1, 2, 1, 1)
+
+        # --- actions ------------------------------------------------------
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.buffer_button = Gtk.Button(label="Stop buffer")
+        self.buffer_button.connect("clicked", self.on_buffer_toggle)
+        actions.append(self.buffer_button)
+
+        open_button = Gtk.Button(label="Open clips folder")
+        open_button.connect("clicked", lambda _b: self.open_path(clips_dir()))
+        actions.append(open_button)
+        root.append(actions)
+
+        root.append(Gtk.Separator())
+
+        # --- recent clips -------------------------------------------------
+        root.append(self._label("Recent clips"))
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.clip_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.clip_list.add_css_class("boxed-list")
+        scroller.set_child(self.clip_list)
+        root.append(scroller)
+
+        self.refresh()
+        GLib.timeout_add(2000, self.refresh)
+
+    # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _label(text):
+        label = Gtk.Label(label=text, xalign=0)
+        label.add_css_class("dim-label")
+        return label
+
+    def _select_monitor(self, name):
+        model = self.monitor_combo.get_model()
+        for index, row in enumerate(model):
+            if row[0] == name:
+                self.monitor_combo.set_active(index)
+                return
+        self.monitor_combo.set_active(0)
+
+    def open_path(self, path):
+        subprocess.Popen(["xdg-open", str(path)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def save_clip(self, seconds):
+        subprocess.Popen([str(BIN / "clip-save"), str(seconds)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.message = f"Saving last {seconds} s…"
+        self.refresh()
+        GLib.timeout_add(3000, self.refresh)
+
+    def restart_buffer(self):
+        pid = buffer_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                pass
+            for _ in range(25):
+                if not buffer_pid():
+                    break
+                time.sleep(0.1)
+        subprocess.Popen([str(BIN / "clip-start")], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.message = "Starting replay buffer…"
+        GLib.timeout_add(2000, self.refresh)
+
+    # -- signal handlers ---------------------------------------------------
+    def on_monitor_changed(self, combo):
+        text = combo.get_active_text() or ""
+        self.cfg["CLIP_MONITOR"] = "" if text.startswith("follow") else text
+        write_config(self.cfg)
+        self.restart_buffer()
+        return False
+
+    def on_buffer_changed(self, spin):
+        self.cfg["CLIP_BUFFER_SECONDS"] = str(int(spin.get_value()))
+        write_config(self.cfg)
+        self.restart_buffer()
+        return False
+
+    def on_mic_toggled(self, switch, _pspec):
+        self.cfg["CLIP_AUDIO"] = ("default_output|default_input"
+                                 if switch.get_active() else "default_output")
+        write_config(self.cfg)
+        self.restart_buffer()
+        return False
+
+    def on_buffer_toggle(self, _button):
+        if buffer_pid():
+            try:
+                os.kill(buffer_pid(), signal.SIGINT)
+            except OSError:
+                pass
+            self.message = "Replay buffer stopped"
+            self.refresh()
+        else:
+            self.restart_buffer()
+
+    # -- refresh -----------------------------------------------------------
+    def refresh(self):
+        if not self.get_visible():
+            return False
+
+        running = buffer_pid() is not None
+        self.buffer_button.set_label("Stop buffer" if running else "Start buffer")
+
+        if running:
+            monitor = buffer_monitor() or "?"
+            self.status.set_markup("<b>Replay buffer running</b>")
+            seconds = int(self.cfg["CLIP_BUFFER_SECONDS"])
+            quality = int(self.cfg["CLIP_QUALITY"])
+            ram = seconds * quality / 8 / 1024
+            mic = "mic on" if mic_on() else "mic off"
+            self.status_detail.set_text(
+                f"{monitor} · {self.cfg['CLIP_FPS']} fps · {seconds} s ≈ {ram:.0f} MB RAM · {mic}"
+            )
+        else:
+            self.status.set_markup("<b>Replay buffer stopped</b>")
+            self.status_detail.set_text("Press Start, or use a clip hotkey to start it.")
+
+        if self.message:
+            self.status_detail.set_text(self.message)
+            self.message = ""
+
+        child = self.clip_list.get_first_child()
+        while child is not None:
+            self.clip_list.remove(child)
+            child = self.clip_list.get_first_child()
+
+        clips = recent_clips()
+        if not clips:
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label="No clips yet", xalign=0)
+            label.set_margin_top(6)
+            label.set_margin_bottom(6)
+            label.set_margin_start(10)
+            row.set_child(label)
+            self.clip_list.append(row)
+        for clip in clips:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            for edge in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{edge}")(6)
+            info = Gtk.Label(xalign=0, hexpand=True)
+            size = clip.stat().st_size / 1024 / 1024
+            info.set_text(f"{clip.name.replace('Replay_', '')}   {size:.1f} MB")
+            box.append(info)
+            play = Gtk.Button(label="Play")
+            play.connect("clicked", lambda _b, p=clip: self.open_path(p))
+            box.append(play)
+            row.set_child(box)
+            self.clip_list.append(row)
+
+        return False
+
+
+def main():
+    app = Gtk.Application(application_id="dev.local.ClipsUI")
+
+    def on_activate(application):
+        win = ClipsWindow(application)
+        win.present()
+        app = None
+        return win
+
+    app.connect("activate", on_activate)
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

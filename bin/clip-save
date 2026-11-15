@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Hotkey handler: save the last N seconds of screen/gameplay.
+#   clip-save       -> CLIP_SECONDS (default 30)
+#   clip-save 15    -> last 15 s
+#   clip-save 60    -> last 60 s (capped by the replay buffer length in clip-start)
+set -u
+
+SECS="${1:-${CLIP_SECONDS:-30}}"
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/gsr-replay.sock"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/gsr-replay.pid"
+GSRCLI="$HOME/.local/bin/gsr-cli"
+
+pid="$(cat "$PIDFILE" 2>/dev/null)"
+if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    pid="$(pgrep -x gpu-screen-reco 2>/dev/null | head -1)"
+fi
+
+if [ -z "$pid" ]; then
+    # Buffer not running (fresh boot or it died): start it and say why this
+    # press produced no file, instead of failing silently.
+    "$HOME/.local/bin/clip-start"
+    notify-send -a Clips -i video-x-generic "Replay buffer started" \
+        "No clip this time - press the clip key again in a few seconds."
+    exit 0
+fi
+
+# Preferred: ask for exactly N seconds over IPC, so a single buffer serves every
+# clip length (the plain signal can only save the whole buffer).
+if [ -x "$GSRCLI" ] && "$GSRCLI" -ipc "$SOCK" save-replay "$SECS" >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Fallback: signals save the entire buffered window.
+if ! kill -USR1 "$pid" 2>/dev/null; then
+    notify-send -a Clips -i dialog-error "Clip failed" \
+        "Replay buffer (pid $pid) did not accept the save request."
+    exit 1
+fi
+exit 0
